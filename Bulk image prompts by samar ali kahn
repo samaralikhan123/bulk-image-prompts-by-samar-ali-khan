@@ -1,0 +1,366 @@
+# app.py
+import streamlit as st
+import re
+from datetime import datetime
+import pandas as pd
+import json
+from io import StringIO, BytesIO
+
+# Optional libs for docx/pdf parsing
+try:
+    from docx import Document
+except Exception:
+    Document = None
+
+try:
+    import PyPDF2
+except Exception:
+    PyPDF2 = None
+
+st.set_page_config(page_title="Bulk Image Prompt Generator", layout="wide")
+st.title("Bulk AI Prompt Generator — Script → Characters → Prompts")
+
+st.markdown(
+    """
+Upload your script (.txt, .docx, .pdf).  
+Choose parsing mode (line/scene/character). Confirm detected characters, adjust styles/presets, upload reference images (optional), and export prompts as CSV/JSON.
+"""
+)
+
+# -------------------------
+# Helpers: text extraction
+# -------------------------
+def extract_text_from_txt(uploaded_file):
+    return uploaded_file.getvalue().decode("utf-8", errors="ignore")
+
+def extract_text_from_docx(uploaded_file):
+    if Document is None:
+        st.error("python-docx not installed. `pip install python-docx`")
+        return ""
+    doc = Document(uploaded_file)
+    paragraphs = [p.text for p in doc.paragraphs if p.text.strip() != ""]
+    return "\n".join(paragraphs)
+
+def extract_text_from_pdf(uploaded_file):
+    if PyPDF2 is None:
+        st.error("PyPDF2 not installed. `pip install PyPDF2`")
+        return ""
+    reader = PyPDF2.PdfReader(uploaded_file)
+    out = []
+    for p in reader.pages:
+        try:
+            out.append(p.extract_text() or "")
+        except Exception:
+            out.append("")
+    return "\n".join(out)
+
+def auto_detect_characters(text):
+    """
+    Tries multiple heuristics:
+    1) Lines like "CHARACTER: dialogue"
+    2) Names in all-caps at line start
+    3) Frequent capitalized words (simple heuristic)
+    """
+    chars = set()
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # heuristic 1: NAME: dialogue
+    for ln in lines:
+        m = re.match(r"^([A-Z][A-Z0-9 _]{1,40})\s*:", ln)
+        if m:
+            chars.add(m.group(1).title())
+    # heuristic 2: all-caps single/short words
+    for ln in lines[:500]:
+        m = re.match(r"^([A-Z]{2,30})(?:\s|$)", ln)
+        if m:
+            chars.add(m.group(1).title())
+    # heuristic 3: frequent capitalized words
+    tokens = re.findall(r"\b[A-Z][a-z]{1,30}\b", text)
+    freq = {}
+    for t in tokens:
+        freq[t] = freq.get(t, 0) + 1
+    for k, v in sorted(freq.items(), key=lambda x: -x[1])[:20]:
+        if v >= 3:
+            chars.add(k)
+    # final cleaning
+    chars = {c.strip() for c in chars if len(c.strip()) > 1}
+    return sorted(list(chars))
+
+def split_into_scenes(text):
+    # simplistic: split on SCENE/INT./EXT./--- or blank-line clusters
+    parts = re.split(r"(?:\n-{3,}\n)|(?:\n\s*(SCENE|INT\.|EXT\.)[^\n]*\n)", text, flags=re.IGNORECASE)
+    # fallback: chunk by blocks separated by 2+ newlines
+    if len(parts) < 2:
+        parts = re.split(r"\n{2,}", text)
+    scenes = [p.strip() for p in parts if p and p.strip()]
+    return scenes
+
+def split_into_lines(text):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return lines
+
+# -------------------------
+# UI: Upload + options
+# -------------------------
+uploaded = st.file_uploader("Upload script (.txt / .docx / .pdf) or paste text below", type=["txt", "docx", "pdf"])
+paste_text = st.text_area("—or paste your script text here (optional)", height=150)
+
+parse_mode = st.radio("Parsing mode", ("Line-by-line", "Scene-by-scene", "Character-by-character"))
+
+# Prompt variation option
+variations = st.selectbox("Prompts per item (variations)", [1, 2, 3], index=0)
+
+# Style box + presets
+st.subheader("Style / Prompt Controls")
+preset = st.selectbox("Style Preset (optional)", ["None", "Nigerian Folktale", "Modern YouTube Thumbnail", "Cinematic Realism", "Cartoon/Anime"])
+style_box = st.text_area("Style box — write your style instructions (free-text). This will be appended to every prompt.", placeholder="e.g. cinematic lighting, warm color palette, 35mm lens, detailed textures, Yoruba patterns...", height=120)
+
+# DreamBooth / reference image options
+st.subheader("Face Consistency Options")
+consistency_mode = st.selectbox("Consistency method", ["Reference image per character (recommended, instant)", "DreamBooth/Textual-Inversion (train required)", "None"])
+st.markdown("If you choose **Reference image**, you will be able to upload one image per detected character below. If you choose DreamBooth, the app will only add a placeholder token; actual training must be done separately with your model provider.")
+
+# Other settings
+st.write("Export options")
+export_csv = st.checkbox("Enable CSV export", value=True)
+export_json = st.checkbox("Enable JSON export", value=True)
+include_channel_tips = st.checkbox("Include thumbnail/title optimization tips in prompt (auto)", value=True)
+
+# -------------------------
+# Parse uploaded file
+# -------------------------
+text = ""
+if uploaded is not None:
+    fname = uploaded.name.lower()
+    if fname.endswith(".txt"):
+        text = extract_text_from_txt(uploaded)
+    elif fname.endswith(".docx"):
+        text = extract_text_from_docx(uploaded)
+    elif fname.endswith(".pdf"):
+        text = extract_text_from_pdf(uploaded)
+    else:
+        st.error("Unsupported file type.")
+if paste_text and not text:
+    text = paste_text
+
+if not text:
+    st.info("No script loaded yet. Upload a file or paste text to proceed.")
+    st.stop()
+
+st.success("Script loaded. Size: {} characters.".format(len(text)))
+
+# Show a small preview
+with st.expander("Show script preview"):
+    st.write(text[:4000] + ("...\n\n(Preview truncated)" if len(text) > 4000 else ""))
+
+# Auto-detect characters
+detected_chars = auto_detect_characters(text)
+st.subheader("Detected Characters")
+st.info("We auto-detected these characters. Edit names, add new ones, or remove unwanted ones.")
+
+# Allow user to edit detected characters
+char_cols = st.columns(3)
+char_inputs = []
+for i, c in enumerate(detected_chars):
+    col = char_cols[i % 3]
+    newname = col.text_input(f"Character {i+1}", value=c, key=f"char_{i}")
+    char_inputs.append(newname)
+# Allow adding extra blank rows
+add_count = st.number_input("Add empty character slots", min_value=0, max_value=20, value=0)
+start = len(detected_chars)
+for j in range(add_count):
+    name = st.text_input(f"New Character {start + j + 1}", value="", key=f"newchar_{j}")
+    if name.strip():
+        char_inputs.append(name.strip())
+
+# Finalize character list
+characters = [c.strip() for c in char_inputs if c and c.strip()]
+if not characters:
+    st.warning("No characters confirmed. You can still generate prompts per line/scene instead.")
+else:
+    st.success(f"{len(characters)} characters confirmed.")
+
+# Reference image uploads per character (if chosen)
+char_images = {}
+if consistency_mode.startswith("Reference"):
+    st.subheader("Upload reference images (optional) — one per character")
+    for ch in characters:
+        img = st.file_uploader(f"Reference image for {ch} (jpg/png)", type=["png", "jpg", "jpeg"], key=f"img_{ch}")
+        if img is not None:
+            char_images[ch] = img
+
+# -------------------------
+# Build items based on parse_mode
+# -------------------------
+items = []
+if parse_mode == "Line-by-line":
+    items = split_into_lines(text)
+elif parse_mode == "Scene-by-scene":
+    items = split_into_scenes(text)
+elif parse_mode == "Character-by-character":
+    # group lines by character if possible
+    lines = split_into_lines(text)
+    char_blocks = {c: [] for c in characters}
+    current = None
+    for ln in lines:
+        m = re.match(r"^([A-Za-z0-9 _]{1,40})\s*:", ln)
+        if m:
+            speaker = m.group(1).strip().title()
+            if speaker in char_blocks:
+                current = speaker
+                rest = ln.split(":", 1)[1].strip()
+                if rest:
+                    char_blocks[current].append(rest)
+            else:
+                # if unknown speaker, ignore or assign to 'Others'
+                current = None
+        else:
+            if current:
+                char_blocks[current].append(ln)
+    # create items as concatenated blocks per character
+    items = []
+    for c, bl in char_blocks.items():
+        if bl:
+            items.append({"character": c, "text": " ".join(bl)})
+    # keep as dicts for later
+else:
+    items = split_into_lines(text)
+
+# Show item count & preview
+st.write("---")
+if parse_mode == "Character-by-character":
+    st.write(f"Generated {len(items)} character-block items.")
+    with st.expander("Preview character blocks"):
+        for it in items[:20]:
+            st.markdown(f"**{it['character']}**: {it['text'][:250]}...")
+else:
+    st.write(f"Generated {len(items)} items ({parse_mode}).")
+    with st.expander("Preview items"):
+        for i, it in enumerate(items[:50]):
+            st.write(f"{i+1}. {str(it)[:300]}")
+
+# -------------------------
+# Prompt generation
+# -------------------------
+st.write("---")
+st.header("Generate Prompts")
+prompt_button = st.button("Generate Prompts Now")
+
+def build_prompt(subject="", source_text="", style_extra="", preset="None", include_tips=True, reference_token=None):
+    """
+    Create a prompt string combining template pieces.
+    subject: main subject (character name or item)
+    source_text: short excerpt that describes movement/environment
+    style_extra: user style string
+    preset: preset name to apply some automatic tags
+    reference_token: if DreamBooth, add placeholder token like <char_token>
+    """
+    preset_map = {
+        "Nigerian Folktale": "Nigerian folk motifs, traditional fabric patterns, warm earth tones, oral-storytelling vibe",
+        "Modern YouTube Thumbnail": "high contrast, large facial expression, bold composition, short depth-of-field",
+        "Cinematic Realism": "cinematic lighting, film grain, shallow depth of field, high-detail skin texture",
+        "Cartoon/Anime": "anime style, bold outlines, expressive eyes, clean colors, cel-shading"
+    }
+    pieces = []
+    # Subject line
+    if reference_token:
+        pieces.append(f"Subject: {reference_token} ({subject})")
+    else:
+        pieces.append(f"Subject: {subject}")
+    # Short description
+    if source_text:
+        excerpt = source_text.strip()
+        if len(excerpt) > 220:
+            excerpt = excerpt[:220] + "..."
+        pieces.append(f"Action/Scene: {excerpt}")
+    # Environment heuristic (try to detect words like 'village', 'road', 'market')
+    env = ""
+    env_candidates = ["village","market","school","home","forest","road","city","compound","river","desert","house","court"]
+    for w in env_candidates:
+        if re.search(r"\b" + re.escape(w) + r"\b", source_text, flags=re.IGNORECASE):
+            env = w
+            break
+    if env:
+        pieces.append(f"Environment: {env}")
+    # style/preset
+    if preset and preset != "None":
+        pieces.append(preset_map.get(preset, ""))
+    # user style
+    if style_extra:
+        pieces.append(style_extra)
+    # include tips
+    if include_tips:
+        pieces.append("Thumbnail tip: emphasize strong facial emotion, bold text space, high contrast.")
+    # base: camera/clothing/age/mood
+    pieces.append("Camera: tight portrait or mid-shot, cinematic framing, 35mm or 50mm lens.")
+    pieces.append("Clothing: culturally-relevant clothing if specified; add rich textures.")
+    pieces.append("Mood: specify emotion clearly (angry, joyful, sorrowful).")
+    # unify
+    prompt = " | ".join([p for p in pieces if p])
+    return prompt
+
+if prompt_button:
+    generated = []
+    timestamp = datetime.utcnow().isoformat()
+    if parse_mode == "Character-by-character":
+        for it in items:
+            subj = it["character"]
+            src = it["text"]
+            for v in range(variations):
+                ref_token = None
+                # if dreambooth chosen, placeholder token
+                if consistency_mode.startswith("DreamBooth"):
+                    ref_token = f"<{subj.replace(' ','_').lower()}_token>"
+                prompt_text = build_prompt(subject=subj, source_text=src, style_extra=style_box, preset=preset, include_tips=include_channel_tips, reference_token=ref_token)
+                generated.append({"Subject": subj, "Source": src[:400], "Prompt": prompt_text, "Variation": v+1, "ReferenceImage": bool(char_images.get(subj))})
+    else:
+        # line/scene mode -> each item is a text block; we optionally try to detect subject (character) by name presence
+        for idx, it in enumerate(items):
+            src = it if isinstance(it, str) else str(it)
+            detected_subj = None
+            # find first matching confirmed character name in the text
+            for ch in characters:
+                if re.search(r"\b" + re.escape(ch.split()[0]) + r"\b", src, flags=re.IGNORECASE):
+                    detected_subj = ch
+                    break
+            subj = detected_subj if detected_subj else f"Scene-{idx+1}"
+            for v in range(variations):
+                ref_token = None
+                if detected_subj and consistency_mode.startswith("DreamBooth"):
+                    ref_token = f"<{detected_subj.replace(' ','_').lower()}_token>"
+                prompt_text = build_prompt(subject=subj, source_text=src, style_extra=style_box, preset=preset, include_tips=include_channel_tips, reference_token=ref_token)
+                generated.append({"Subject": subj, "Source": src[:400], "Prompt": prompt_text, "Variation": v+1, "ReferenceImage": bool(char_images.get(subj))})
+    # Create DataFrame
+    df = pd.DataFrame(generated)
+    st.success(f"Generated {len(df)} prompts.")
+    st.dataframe(df.head(200))
+
+    # Export buttons
+    if export_csv:
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", data=csv_bytes, file_name=f"prompts_{timestamp}.csv", mime="text/csv")
+    if export_json:
+        json_bytes = df.to_json(orient="records", force_ascii=False).encode("utf-8")
+        st.download_button("Download JSON", data=json_bytes, file_name=f"prompts_{timestamp}.json", mime="application/json")
+
+    # Optionally show example of how to call Google Cloud / generate images
+    with st.expander("How to integrate with Google Cloud / image generation (placeholder)"):
+        st.code(
+            """
+# Example (placeholder) - you must implement proper auth and calls depending on the model/provider.
+# Pseudocode:
+for row in generated:
+    prompt = row['Prompt']
+    # if reference image provided:
+    #   upload ref image to provider or include in request (img2img)
+    # call google/other API to generate image
+    # save result
+            """, language="python"
+        )
+
+    st.info("Note: DreamBooth / TI requires model training on provider side and can't be executed just from this UI. For instant consistency, upload a reference image per character and use img2img or conditioning features of your image provider.")
+
+# -------------------------
+# End of app
+# -------------------------
+st.write("---")
+st.markdown("Built as a Streamlit single-file starter. Add your own model integration where marked. For better character detection you can refine heuristics or provide explicit character list in the UI.")
